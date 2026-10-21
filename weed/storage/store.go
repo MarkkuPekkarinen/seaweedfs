@@ -97,6 +97,11 @@ type Store struct {
 	// the heartbeat that saw it. Written only from the heartbeat goroutine.
 	reportedCollections   map[string]struct{}
 	reportedEcCollections map[string]struct{}
+	maxVolumeIdSeen       atomic.Uint32
+	lastSeenTopologyId    atomic.Value // string
+	vidStampReady         atomic.Bool
+	vidStampDirty         atomic.Bool
+	vidStampLock          sync.Mutex
 }
 
 func (s *Store) String() (str string) {
@@ -145,6 +150,7 @@ func NewStore(
 		diskId := uint32(i) // Track disk ID
 
 		location.ecShardNotifyHandler = func(collection string, vid needle.VolumeId, shardId erasure_coding.ShardId, ecVolume *erasure_coding.EcVolume) {
+			s.UpdateMaxVolumeIdSeen(vid)
 			si := erasure_coding.NewShardsInfo()
 			si.Set(erasure_coding.NewShardInfo(shardId, erasure_coding.ShardSize(ecVolume.ShardSize())))
 
@@ -210,6 +216,8 @@ func NewStore(
 	if err != nil {
 		glog.Fatalf("failed to resolve state for volume %s: %v", id, err)
 	}
+
+	s.bootstrapMaxVolumeIdSeen()
 
 	return
 }
@@ -320,6 +328,7 @@ func (s *Store) FindFreeLocation(filterFn func(location *DiskLocation) bool, rep
 	return ret
 }
 func (s *Store) addVolume(vid needle.VolumeId, collection string, needleMapKind NeedleMapKind, replicaPlacement *super_block.ReplicaPlacement, ttl *needle.TTL, preallocate int64, ver needle.Version, memoryMapMaxSizeMb uint32, diskType DiskType, ldbTimeout int64) error {
+	s.UpdateMaxVolumeIdSeen(vid)
 	if s.findVolume(vid) != nil {
 		return fmt.Errorf("Volume Id %d already exists!", vid)
 	}
@@ -686,27 +695,29 @@ func (s *Store) CollectHeartbeat() *master_pb.Heartbeat {
 	stats.VolumeServerIoQuarantineGauge.WithLabelValues("ec_shard").Set(float64(quarantinedEcShards))
 
 	return &master_pb.Heartbeat{
-		Ip:              s.Ip,
-		Port:            uint32(s.Port),
-		GrpcPort:        uint32(s.GrpcPort),
-		PublicUrl:       s.PublicUrl,
-		Id:              s.Id,
-		MaxVolumeCounts: maxVolumeCounts,
-		DiskTotalBytes:  diskTotalBytes,
-		DiskFreeBytes:   diskFreeBytes,
-		MaxFileKey:      NeedleIdToUint64(maxFileKey),
-		DataCenter:      s.dataCenter,
-		Rack:            s.rack,
-		Volumes:         heartbeatVolumes,
-		ChangedVolumes:  changedVolumes,
-		DeletedVolumes:  departedVolumes,
-		VolumeDigest:    &volumeDigest,
-		DeletedEcShards: deletedEcVolumes,
-		HasNoVolumes:    hasNoVolumes,
-		HasNoEcShards:   len(ecVolumeMessages) == 0,
-		LocationUuids:   uuidList,
-		DiskTags:        diskTags,
-		State:           state,
+		Ip:                 s.Ip,
+		Port:               uint32(s.Port),
+		GrpcPort:           uint32(s.GrpcPort),
+		PublicUrl:          s.PublicUrl,
+		Id:                 s.Id,
+		MaxVolumeCounts:    maxVolumeCounts,
+		DiskTotalBytes:     diskTotalBytes,
+		DiskFreeBytes:      diskFreeBytes,
+		MaxFileKey:         NeedleIdToUint64(maxFileKey),
+		DataCenter:         s.dataCenter,
+		Rack:               s.rack,
+		Volumes:            heartbeatVolumes,
+		ChangedVolumes:     changedVolumes,
+		DeletedVolumes:     departedVolumes,
+		VolumeDigest:       &volumeDigest,
+		DeletedEcShards:    deletedEcVolumes,
+		HasNoVolumes:       hasNoVolumes,
+		HasNoEcShards:      len(ecVolumeMessages) == 0,
+		LocationUuids:      uuidList,
+		DiskTags:           diskTags,
+		State:              state,
+		MaxVolumeIdSeen:    uint32(s.MaxVolumeIdSeen()),
+		LastSeenTopologyId: s.LastSeenTopologyId(),
 	}
 
 }
@@ -900,10 +911,16 @@ func (s *Store) MarkVolumeReadonly(i needle.VolumeId, canDelete bool, persist bo
 	if v == nil {
 		return fmt.Errorf("volume %d not found", i)
 	}
+	// Wait for in-flight appends so a mark acked mid-write cannot race an
+	// encode that reads the index and deletes the replica the write lands on.
+	v.dataFileSyncLock.Lock()
+	defer v.dataFileSyncLock.Unlock()
+	v.dataFileAccessLock.Lock()
+	defer v.dataFileAccessLock.Unlock()
 	if canDelete && !v.HasRemoteFile() {
 		// deletes append tombstones to .idx, which a readonly boot opened
 		// O_RDONLY; remote volumes already delete through a RDWR idx
-		if err := v.reopenIdxForWrite(); err != nil {
+		if err := v.reopenIdxForWriteLocked(); err != nil {
 			return fmt.Errorf("volume %d reopen idx for write: %v", i, err)
 		}
 	}
@@ -1023,6 +1040,7 @@ func (s *Store) mountVolume(i needle.VolumeId, collection *string, validators ..
 				ReadOnly:          readOnly,
 				ReadOnlyCanDelete: readOnlyCanDelete,
 			}
+			s.UpdateMaxVolumeIdSeen(i)
 			return nil
 		}
 	}
@@ -1191,6 +1209,7 @@ func (s *Store) deleteVolumeGuarded(i needle.VolumeId, onlyEmpty bool, onlyGarba
 	unlockAll := func() {
 		for _, v := range lockedVolumes {
 			v.dataFileAccessLock.Unlock()
+			v.dataFileSyncLock.Unlock()
 		}
 		for _, location := range lockedLocations {
 			location.volumesLock.Unlock()
@@ -1201,6 +1220,7 @@ func (s *Store) deleteVolumeGuarded(i needle.VolumeId, onlyEmpty bool, onlyGarba
 	for _, location := range s.Locations {
 		location.volumesLock.Lock()
 		if v, ok := location.volumes[i]; ok {
+			v.dataFileSyncLock.Lock()
 			v.dataFileAccessLock.Lock()
 			lockedLocations = append(lockedLocations, location)
 			lockedVolumes = append(lockedVolumes, v)
